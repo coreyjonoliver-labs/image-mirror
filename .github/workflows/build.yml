@@ -1,0 +1,80 @@
+name: build
+
+# Mirrors pinned upstream image digests into this org's GHCR namespace.
+# See README.md for rationale, invariants, and how to add an entry.
+#
+# crane copy is byte-verbatim, so mirrored images keep the UPSTREAM DIGEST —
+# consumers change registry host only, never the pinned digest. The copy step
+# asserts this and fails the run if it ever drifts.
+#
+# The attestation records that THIS workflow placed THAT digest here. It does
+# not, and cannot, vouch for how upstream built the image.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build.yml
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # No published release of velero-plugin-for-aws can write to
+          # Backblaze B2: every released version sets PutObjectInput.Tagging
+          # unconditionally, emitting an empty x-amz-tagging header that B2
+          # rejects outright. This maintenance-branch build carries the
+          # upstream guard for it.
+          - src: velero/velero-plugin-for-aws@sha256:320b020238480256b1815318652f13e8131e67860eab6faaf7dde4c66d17242b
+            dst_repo: ghcr.io/coreyjonoliver-labs/velero-plugin-for-aws
+            dst_tag: release-1.14-b4fd6fb
+    steps:
+      - name: Set up crane
+        uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy image (preserves the multi-arch index and the digest)
+        id: copy
+        env:
+          SRC: ${{ matrix.src }}
+          DST: ${{ matrix.dst_repo }}:${{ matrix.dst_tag }}
+        run: |
+          set -euo pipefail
+          case "$SRC" in
+            *@sha256:*) ;;
+            *) echo "::error::src must be digest-pinned: $SRC"; exit 1 ;;
+          esac
+          crane copy "$SRC" "$DST"
+          SRC_DIGEST="${SRC##*@}"
+          DST_DIGEST="$(crane digest "$DST")"
+          echo "source:      $SRC_DIGEST"
+          echo "destination: $DST_DIGEST"
+          if [ "$SRC_DIGEST" != "$DST_DIGEST" ]; then
+            echo "::error::digest changed during copy"
+            exit 1
+          fi
+          echo "digest=$DST_DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
+        with:
+          subject-name: ${{ matrix.dst_repo }}
+          subject-digest: ${{ steps.copy.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
